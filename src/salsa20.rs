@@ -97,6 +97,18 @@ impl Salsa20 {
         xsalsa20
     }
 
+    pub fn hsalsa20(key: &[u8], nonce: &[u8], out: &mut [u8]) {
+        let mut hsalsa20 = Salsa20 { state: [0; 64], output: [0; 64], counter: 0, offset: 64 };
+        hsalsa20.hsalsa20_expand(key, &nonce[0..16]);
+        hsalsa20.hsalsa20_hash();
+
+        copy_memory(&mut out[0..4], &hsalsa20.output[0..4]);
+        copy_memory(&mut out[4..8], &hsalsa20.output[20..24]);
+        copy_memory(&mut out[8..12], &hsalsa20.output[40..44]);
+        copy_memory(&mut out[12..16], &hsalsa20.output[60..64]);
+        copy_memory(&mut out[16..32], &hsalsa20.output[24..40]);
+    }
+
     fn expand16(&mut self, key: &[u8], nonce: &[u8]) {
         copy_memory(&mut self.state[0..4], &[101u8, 120, 112, 97]);
         copy_memory(&mut self.state[4..20], key);
