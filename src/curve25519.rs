@@ -3,6 +3,11 @@ use std::cmp::{Eq, PartialEq,min};
 use util::{fixed_time_eq};
 use std::iter::range_step;
 
+use digest::Digest;
+use sha2::{Sha512Trunc256};
+use std::rand::Rng;
+use std::slice::bytes::copy_memory;
+
 /*
 fe means field element.
 Here the field is \Z/(2^255-19).
@@ -2161,9 +2166,75 @@ pub fn curve25519_base(x: &[u8]) -> [u8; 32] {
     curve25519(x, base.as_slice())
 }
 
+#[derive(Debug, Copy)]
+pub struct PublicKey {
+    bytes: [u8; 32]
+}
+
+#[derive(Debug, Copy)]
+pub struct PrivateKey {
+    bytes: [u8; 32],
+    public_key: PublicKey
+}
+
+impl PrivateKey {
+    pub fn new<R: Rng>(rng: &mut R) -> PrivateKey {
+        let mut seed: [u8; 32] = [0u8; 32];
+
+        // Generate 256 bits of random data and compress with SHA512-256 to
+        // to guard against failboat RNG implementations.
+        rng.fill_bytes(&mut seed);
+        let mut sh = Sha512Trunc256::new();
+        sh.input(&seed);
+        sh.result(&mut seed);
+
+        PrivateKey::from_bytes(&seed)
+    }
+
+    pub fn from_bytes(raw: &[u8]) -> PrivateKey {
+        assert!(raw.len() == 32);
+        let mut k = PrivateKey{ bytes: [0u8; 32], public_key: PublicKey{ bytes: [0u8; 32] } };
+        copy_memory(&mut k.bytes, raw);
+
+        // Derive the public key.
+        k.public_key = PublicKey::from_bytes(&(curve25519_base(&k.bytes)));
+
+        k
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+
+    pub fn key_exchange(&self, pk: &PublicKey) -> [u8; 32] {
+        curve25519(self.as_bytes(), pk.as_bytes())
+    }
+}
+
+impl PublicKey {
+    pub fn from_bytes(raw: &[u8]) -> PublicKey {
+        assert!(raw.len() == 32);
+        let mut k = PublicKey{ bytes: [0u8; 32] };
+        copy_memory(&mut k.bytes, raw);
+
+        k
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use curve25519::{Fe, curve25519_base};
+    use curve25519;
+
+    use std::rand::IsaacRng;
 
     #[test]
     fn from_to_bytes_preserves() {
@@ -2254,6 +2325,63 @@ mod tests {
             ,0x0d,0xbf,0x3a,0x0d,0x26,0x38,0x1a,0xf4
             ,0xeb,0xa4,0xa9,0x8e,0xaa,0x9b,0x4e,0x6a ];
         assert_eq!(pk.to_vec(), correct.to_vec());
+    }
+
+    #[test]
+    // nacl-20110221/tests/{scalarmult.c,scalarmult.out}
+    fn api_test_nacl_vector_1() {
+        let alicesk = vec! [
+            0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,
+            0x3c,0x16,0xc1,0x72,0x51,0xb2,0x66,0x45,
+            0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,
+            0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a ];
+        let alicepk = vec! [
+            0x85,0x20,0xf0,0x09,0x89,0x30,0xa7,0x54,
+            0x74,0x8b,0x7d,0xdc,0xb4,0x3e,0xf7,0x5a,
+            0x0d,0xbf,0x3a,0x0d,0x26,0x38,0x1a,0xf4,
+            0xeb,0xa4,0xa9,0x8e,0xaa,0x9b,0x4e,0x6a ];
+
+        let sk = curve25519::PrivateKey::from_bytes(&alicesk[]);
+        assert!(sk.as_bytes().as_slice() == alicesk);
+        assert!(sk.public_key().as_bytes().as_slice() == alicepk);
+    }
+
+    #[test]
+    // nacl-20110221/tests/{scalarmult5.c,scalarmult5.out}
+    fn api_test_nacl_vector_5() {
+        let alicesk = vec! [
+            0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,
+            0x3c,0x16,0xc1,0x72,0x51,0xb2,0x66,0x45,
+            0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,
+            0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a ];
+        let bobpk = vec! [
+            0xde,0x9e,0xdb,0x7d,0x7b,0x7d,0xc1,0xb4,
+            0xd3,0x5b,0x61,0xc2,0xec,0xe4,0x35,0x37,
+            0x3f,0x83,0x43,0xc8,0x5b,0x78,0x67,0x4d,
+            0xad,0xfc,0x7e,0x14,0x6f,0x88,0x2b,0x4f ];
+        let ss = vec! [
+            0x4a,0x5d,0x9d,0x5b,0xa4,0xce,0x2d,0xe1,
+            0x72,0x8e,0x3b,0xf4,0x80,0x35,0x0f,0x25,
+            0xe0,0x7e,0x21,0xc9,0x47,0xd1,0x9e,0x33,
+            0x76,0xf0,0x9b,0x3c,0x1e,0x16,0x17,0x42 ];
+
+        let sk = curve25519::PrivateKey::from_bytes(&alicesk[]);
+        let pk = curve25519::PublicKey::from_bytes(&bobpk[]);
+        let sekrit = sk.key_exchange(&pk);
+        assert!(sekrit.as_slice() == ss);
+    }
+
+    #[test]
+    fn api_test() {
+        // People who do not use OsRng in production will get laughed at.
+        let mut rng = IsaacRng::new_unseeded();
+
+        let alicekp = curve25519::PrivateKey::new(&mut rng);
+        let bobkp = curve25519::PrivateKey::new(&mut rng);
+
+        let alice_bob = alicekp.key_exchange(bobkp.public_key());
+        let bob_alice = bobkp.key_exchange(alicekp.public_key());
+        assert!(alice_bob.as_slice() == bob_alice.as_slice());
     }
 }
 
