@@ -37,6 +37,7 @@ pub mod hmac;
 pub mod hkdf;
 pub mod mac;
 pub mod md5;
+pub mod nacl;
 pub mod pbkdf2;
 pub mod poly1305;
 pub mod rc4;
