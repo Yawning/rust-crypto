@@ -4,9 +4,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::cmp;
 use std::iter::repeat;
 use std::num::Int;
-use cryptoutil::{read_u64v_le, write_u64v_le};
+use cryptoutil::{read_u64v_le, write_u64v_le, write_u32_le, write_u64_le};
 use std::slice::bytes::{copy_memory};
 use std::intrinsics::volatile_set_memory;
 use digest::Digest;
@@ -39,14 +40,16 @@ const BLAKE2B_OUTBYTES : usize = 64;
 const BLAKE2B_KEYBYTES : usize = 64;
 const BLAKE2B_SALTBYTES : usize = 16;
 const BLAKE2B_PERSONALBYTES : usize = 16;
+const BLAKE2B_STRIDE_NONE : usize = 0;
+const BLAKE2B_STRIDE : usize = 128;
 
 #[derive(Copy)]
 pub struct Blake2b {
     h: [u64; 8],
     t: [u64; 2],
     f: [u64; 2],
-    buf: [u8; 2*BLAKE2B_BLOCKBYTES],
-    buflen: usize,
+    buffer: [u8; BLAKE2B_BLOCKBYTES],
+    leftover: usize,
     key: [u8; BLAKE2B_KEYBYTES],
     key_length: u8,
     last_node: u8,
@@ -92,30 +95,14 @@ macro_rules! round( ($r:expr, $v:expr, $m:expr) => ( {
 ));
 
 impl Blake2b {
-    fn set_lastnode(&mut self) {
-        self.f[1] = 0xFFFFFFFFFFFFFFFF;
-    }
-
-    fn set_lastblock(&mut self) {
-        if self.last_node!=0 {
-            self.set_lastnode();
-        }
-        self.f[0] = 0xFFFFFFFFFFFFFFFF;
-    }
-
-    fn increment_counter(&mut self, inc : u64) {
-        self.t[0] += inc;
-        self.t[1] += if self.t[0] < inc { 1 } else { 0 };
-    }
-
     fn init0(digest_length: u8, key: &[u8]) -> Blake2b {
         assert!(key.len() <= BLAKE2B_KEYBYTES);
         let mut b = Blake2b {
             h: IV,
             t: [0,0],
             f: [0,0],
-            buf: [0; 2*BLAKE2B_BLOCKBYTES],
-            buflen: 0,
+            buffer: [0; BLAKE2B_BLOCKBYTES],
+            leftover: 0,
             last_node: 0,
             digest_length: digest_length,
             computed: false,
@@ -127,23 +114,19 @@ impl Blake2b {
     }
 
     fn apply_param(&mut self, p: &Blake2bParam) {
-        use std::old_io::BufWriter;
+        let mut param_bytes = [0u8; 64];
+        param_bytes[0] = p.digest_length;
+        param_bytes[1] = p.key_length;
+        param_bytes[2] = p.fanout;
+        param_bytes[3] = p.depth;
+        write_u32_le(&mut param_bytes[4..8], p.leaf_length);
+        write_u64_le(&mut param_bytes[8..16], p.node_offset);
+        param_bytes[16] = p.node_depth;
+        param_bytes[17] = p.inner_length;
+        copy_memory(&mut param_bytes[18..32], &p.reserved);
+        copy_memory(&mut param_bytes[32..48], &p.salt);
+        copy_memory(&mut param_bytes[48..64], &p.personal);
 
-        let mut param_bytes : [u8; 64] = [0; 64];
-        {
-            let mut writer = BufWriter::new(&mut param_bytes);
-            writer.write_u8(p.digest_length).unwrap();
-            writer.write_u8(p.key_length).unwrap();
-            writer.write_u8(p.fanout).unwrap();
-            writer.write_u8(p.depth).unwrap();
-            writer.write_le_u32(p.leaf_length).unwrap();
-            writer.write_le_u64(p.node_offset).unwrap();
-            writer.write_u8(p.node_depth).unwrap();
-            writer.write_u8(p.inner_length).unwrap();
-            writer.write_all(&p.reserved).unwrap();
-            writer.write_all(&p.salt).unwrap();
-            writer.write_all(&p.personal).unwrap();
-        }
         let mut param_words : [u64; 8] = [0; 8];
         read_u64v_le(&mut param_words, &param_bytes);
         for (h, param_word) in self.h.iter_mut().zip(param_words.iter()) {
@@ -212,97 +195,108 @@ impl Blake2b {
         b
     }
 
-    fn compress(&mut self) {
-        let mut ms: [u64; 16] = [0; 16];
-        let mut vs: [u64; 16] = [0; 16];
+    fn update(&mut self, input: &[u8]) {
+        let mut inlen = input.len();
+        let mut m = input;
 
-        read_u64v_le(&mut ms, &self.buf[0..BLAKE2B_BLOCKBYTES]);
+        // blake2b processes the final <=BLOCKBYTES bytes raw, so we can only
+        // update if there are at least BLOCKBYTES+1 bytes available.
+        if self.leftover + inlen > BLAKE2B_BLOCKBYTES {
+            let mut bytes: usize;
 
-        for (v, h) in vs.iter_mut().zip(self.h.iter()) {
-            *v = *h;
-        }
+            // handle the previous data, we know there is enough for at least
+            // one block.
+            if self.leftover > 0 {
+                bytes = BLAKE2B_BLOCKBYTES - self.leftover;
+                copy_memory(&mut self.buffer[self.leftover..], &input[..bytes]);
+                m = &m[bytes..];
+                inlen -= bytes;
+                self.leftover = 0;
+                let tmp = self.buffer;
+                self.blocks(&tmp, BLAKE2B_BLOCKBYTES, BLAKE2B_STRIDE_NONE);
+            }
 
-        vs[ 8] = IV[0];
-        vs[ 9] = IV[1];
-        vs[10] = IV[2];
-        vs[11] = IV[3];
-        vs[12] = self.t[0] ^ IV[4];
-        vs[13] = self.t[1] ^ IV[5];
-        vs[14] = self.f[0] ^ IV[6];
-        vs[15] = self.f[1] ^ IV[7];
-        round!(  0, vs, ms );
-        round!(  1, vs, ms );
-        round!(  2, vs, ms );
-        round!(  3, vs, ms );
-        round!(  4, vs, ms );
-        round!(  5, vs, ms );
-        round!(  6, vs, ms );
-        round!(  7, vs, ms );
-        round!(  8, vs, ms );
-        round!(  9, vs, ms );
-        round!( 10, vs, ms );
-        round!( 11, vs, ms );
-
-        for (h_elem, (v_low, v_high)) in self.h.iter_mut().zip( vs[0..8].iter().zip(vs[8..16].iter()) ) {
-            *h_elem = *h_elem ^ *v_low ^ *v_high;
-        }
-    }
-
-    fn update( &mut self, mut input: &[u8] ) {
-        while input.len() > 0 {
-            let left = self.buflen;
-            let fill = 2 * BLAKE2B_BLOCKBYTES - left;
-
-            if input.len() > fill {
-                copy_memory( &mut self.buf[left..], &input[0..fill] ); // Fill buffer
-                self.buflen += fill;
-                self.increment_counter( BLAKE2B_BLOCKBYTES as u64);
-                self.compress();
-
-                let mut halves = self.buf.chunks_mut(BLAKE2B_BLOCKBYTES);
-                let first_half = halves.next().unwrap();
-                let second_half = halves.next().unwrap();
-                copy_memory(first_half, second_half);
-
-                self.buflen -= BLAKE2B_BLOCKBYTES;
-                input = &input[fill..input.len()];
-            } else { // inlen <= fill
-                copy_memory(&mut self.buf[left..], input);
-                self.buflen += input.len();
-                break;
+            // handle the direct data (if any).  always need to leave at least
+            // BLAKE2B_BLOCKBYTES in case this is the final block
+            if inlen > BLAKE2B_BLOCKBYTES {
+                bytes = (inlen - 1) & !(BLAKE2B_BLOCKBYTES - 1);
+                self.blocks(&m[0..bytes], bytes, BLAKE2B_STRIDE);
+                inlen -= bytes;
+                m = &m[bytes..];
             }
         }
+
+        // handle leftover data
+        copy_memory(&mut self.buffer[self.leftover..self.leftover+m.len()], m);
+        self.leftover += inlen;
     }
 
-    fn finalize( &mut self, out: &mut [u8] ) {
+    fn finalize(&mut self, out: &mut [u8]) {
         assert!(out.len() == self.digest_length as usize);
         if !self.computed {
-            if self.buflen > BLAKE2B_BLOCKBYTES {
-                self.increment_counter(BLAKE2B_BLOCKBYTES as u64);
-                self.compress();
-                self.buflen -= BLAKE2B_BLOCKBYTES;
-
-                let mut halves = self.buf.chunks_mut(BLAKE2B_BLOCKBYTES);
-                let first_half = halves.next().unwrap();
-                let second_half = halves.next().unwrap();
-                copy_memory(first_half, second_half);
+            self.f[0] = 0xFFFFFFFFFFFFFFFF;
+            for i in range(self.leftover, BLAKE2B_BLOCKBYTES) {
+                self.buffer[i] = 0;
             }
-
-            let incby = self.buflen as u64;
-            self.increment_counter(incby);
-            self.set_lastblock();
-            let mut temp_buf = self.buf;
-            let buf_slice = &mut temp_buf[self.buflen..];
-            for b in buf_slice.iter_mut() {
-                *b = 0;
-            }
-            self.compress();
-
-            write_u64v_le(&mut self.buf[0..64], &self.h);
+            let tmp = self.buffer;
+            let tmplen = self.leftover;
+            self.blocks(&tmp, tmplen, BLAKE2B_STRIDE_NONE);
+            write_u64v_le(&mut self.buffer[0..64], &self.h);
             self.computed = true;
         }
         let outlen = out.len();
-        copy_memory(out, &self.buf[0..outlen]);
+        copy_memory(out, &self.buffer[0..outlen]);
+    }
+
+    fn blocks(&mut self, input: &[u8], mut bytes: usize, stride: usize) {
+        let mut m = input;
+
+        let inc = cmp::min(bytes, 128) as u64;
+
+        let mut ms: [u64; 16] = [0; 16];
+        let mut vs: [u64; 16] = [0; 16];
+
+        loop {
+            read_u64v_le(&mut ms, &m[0..BLAKE2B_BLOCKBYTES]);
+
+            self.t[0] += inc;
+            self.t[1] += if self.t[0] < inc { 1 } else { 0 };
+
+            for (v, h) in vs.iter_mut().zip(self.h.iter()) {
+                *v = *h;
+            }
+
+            vs[ 8] = IV[0];
+            vs[ 9] = IV[1];
+            vs[10] = IV[2];
+            vs[11] = IV[3];
+            vs[12] = self.t[0] ^ IV[4];
+            vs[13] = self.t[1] ^ IV[5];
+            vs[14] = self.f[0] ^ IV[6];
+            vs[15] = self.f[1] ^ IV[7];
+            round!(  0, vs, ms );
+            round!(  1, vs, ms );
+            round!(  2, vs, ms );
+            round!(  3, vs, ms );
+            round!(  4, vs, ms );
+            round!(  5, vs, ms );
+            round!(  6, vs, ms );
+            round!(  7, vs, ms );
+            round!(  8, vs, ms );
+            round!(  9, vs, ms );
+            round!( 10, vs, ms );
+            round!( 11, vs, ms );
+
+            for (h_elem, (v_low, v_high)) in self.h.iter_mut().zip( vs[0..8].iter().zip(vs[8..16].iter()) ) {
+                *h_elem = *h_elem ^ *v_low ^ *v_high;
+            }
+
+            if bytes <= 128 {
+                break;
+            }
+            m = &m[stride..];
+            bytes -= 128;
+        }
     }
 
     pub fn blake2b(out: &mut[u8], input: &[u8], key: &[u8]) {
@@ -325,10 +319,10 @@ impl Digest for Blake2b {
         for f_elem in self.f.iter_mut() {
             *f_elem = 0;
         }
-        for b in self.buf.iter_mut() {
+        for b in self.buffer.iter_mut() {
             *b = 0;
         }
-        self.buflen = 0;
+        self.leftover = 0;
         self.last_node = 0;
         self.computed = false;
         let len = self.digest_length;
@@ -365,10 +359,10 @@ impl Mac for Blake2b {
         for f_elem in self.f.iter_mut() {
             *f_elem = 0;
         }
-        for b in self.buf.iter_mut() {
+        for b in self.buffer.iter_mut() {
             *b = 0;
         }
-        self.buflen = 0;
+        self.leftover = 0;
         self.last_node = 0;
         self.computed = false;
         let len = self.digest_length;
